@@ -33,20 +33,21 @@ class ArbitrageSystem:
         # 差价套利开仓条件
         if price_spread >= self.X and price_spread > avg_price_spread:
             if same_direction and funding_spread < self.Y:
-                self.open_position('差价套利', '条件a', current, price_spread, funding_spread, avg_price_spread, '相同')
+                return self.open_position('差价套利', '条件a', current, price_spread, funding_spread, avg_price_spread, '相同')
             elif not same_direction and funding_spread < self.B:
-                self.open_position('差价套利', '条件b', current, price_spread, funding_spread, avg_price_spread, '不同')
+                return self.open_position('差价套利', '条件b', current, price_spread, funding_spread, avg_price_spread, '不同')
 
         # 资金费率套利开仓条件
         if funding_spread >= self.Y and all(history['funding_a'] - history['funding_b'] >= self.Y):
             if same_direction and price_spread < self.X:
-                self.open_position('资金费率套利', '条件a', current, price_spread, funding_spread, avg_price_spread, '相同')
+                return self.open_position('资金费率套利', '条件a', current, price_spread, funding_spread, avg_price_spread, '相同')
             elif not same_direction and price_spread < self.A:
-                self.open_position('资金费率套利', '条件b', current, price_spread, funding_spread, avg_price_spread, '不同')
+                return self.open_position('资金费率套利', '条件b', current, price_spread, funding_spread, avg_price_spread, '不同')
 
         # 组合套利开仓条件
         if same_direction and price_spread >= self.X and price_spread > avg_price_spread and funding_spread >= self.Y and all(history['funding_a'] - history['funding_b'] >= self.Y):
-            self.open_position('组合套利', '条件', current, price_spread, funding_spread, avg_price_spread, '相同')
+            return self.open_position('组合套利', '条件', current, price_spread, funding_spread, avg_price_spread, '相同')
+        return None
 
     def open_position(self, mode, cond, current, price_spread, funding_spread, avg_price_spread, direction):
         # 记录开仓信息
@@ -285,10 +286,26 @@ df['price_b'] = df['binance_price']
 df['funding_a'] = df['okx_funding']
 df['funding_b'] = df['binance_funding']
 
-# 运行套利逻辑
+
+# 模拟实时交易：开仓后从下一个数据点开始判断平仓
+open_positions = []  # 存储未平仓持仓的索引和信息
 for idx in range(len(df)):
-    system.check_open(df, idx)
-    system.check_close(df, idx)
+    # 只在当前时刻判断是否开仓
+    pos = system.check_open(df, idx)
+    if pos is not None:
+        # 记录开仓时的索引，便于后续平仓判断
+        open_positions.append({'open_idx': idx, 'pos_ref': system.positions[-1]})
+
+# 对每个持仓，从开仓点的下一个数据点开始，逐步判断平仓
+for op in open_positions:
+    open_idx = op['open_idx']
+    pos_ref = op['pos_ref']
+    # 只要未平仓，就继续往后判断
+    for idx in range(open_idx + 1, len(df)):
+        if not pos_ref['平仓']:
+            system.check_close(df, idx)
+        else:
+            break
 
 # 输出开仓和平仓信息到文件
 def convert(obj):
