@@ -46,7 +46,7 @@ class ArbitrageSystem:
 
         # 组合套利开仓条件
         if same_direction and price_spread >= self.X and price_spread > avg_price_spread and funding_spread >= self.Y and all(history['funding_a'] - history['funding_b'] >= self.Y):
-            self.open_position('组合套利', '条件a', current, price_spread, funding_spread, avg_price_spread, '相同')
+            self.open_position('组合套利', '条件', current, price_spread, funding_spread, avg_price_spread, '相同')
 
     def open_position(self, mode, cond, current, price_spread, funding_spread, avg_price_spread, direction):
         # 记录开仓信息
@@ -74,15 +74,83 @@ class ArbitrageSystem:
             current = df.iloc[idx]
             price_spread = current['price_a'] - current['price_b']
             funding_spread = current['funding_a'] - current['funding_b']
-            # 这里只写了部分平仓逻辑，具体可按你的规则补充
+            # 差价套利
             if pos['触发模式'] == '差价套利':
-                # 盈利平仓
-                if price_spread >= self.P:
-                    self.close_position(pos, current, '盈利平仓')
-                # 亏损止损
-                elif price_spread <= -self.Q:
-                    self.close_position(pos, current, '亏损止损')
-            # 资金费率套利和平仓逻辑同理
+                # 条件a（相同方向差价套利）
+                if pos['触发条件'] == '条件a':
+                    # 平仓条件a: 价格回归盈利
+                    if price_spread >= self.P:
+                        self.close_position(pos, current, '价格回归盈利')
+                        continue
+                    # 平仓条件b: 资金费率反转止损
+                    # 价差无利可图
+                    if price_spread < self.X:
+                        # 资金费率方向反转（赚取变成支付）
+                        open_funding_spread = pos['开仓资金费率差']
+                        funding_direction_reversed = (open_funding_spread > 0 and funding_spread < 0) or (open_funding_spread < 0 and funding_spread > 0)
+                        # 资金费率数值 > A 且持续时间 > M
+                        if funding_direction_reversed and abs(funding_spread) > self.A:
+                            # 检查持续时间
+                            close_idx = idx
+                            open_idx = df.index.get_loc(pos['开仓时间戳'])
+                            if close_idx - open_idx >= self.M:
+                                self.close_position(pos, current, '资金费率反转止损')
+                                continue
+                        # 平仓条件c: 价差亏损止损
+                        if price_spread <= -self.Q:
+                            self.close_position(pos, current, '价差亏损止损')
+                            continue
+                # 条件b（不同方向差价套利）
+                elif pos['触发条件'] == '条件b':
+                    # 平仓条件a: 价格回归盈利
+                    if price_spread >= self.P:
+                        self.close_position(pos, current, '价格回归盈利')
+                        continue
+                    # 平仓条件b: 资金费率扩大止损
+                    if price_spread < self.X:
+                        # 需要支付资金费率
+                        if funding_spread < 0:
+                            # 资金费率阈值从 < A 变成 > B
+                            open_funding_spread = pos['开仓资金费率差']
+                            if abs(open_funding_spread) < self.A and abs(funding_spread) > self.B:
+                                # 检查持续时间
+                                close_idx = idx
+                                open_idx = df.index.get_loc(pos['开仓时间戳'])
+                                if close_idx - open_idx >= self.M:
+                                    self.close_position(pos, current, '资金费率扩大止损')
+                                    continue
+                        # 平仓条件c: 价差亏损止损
+                        if price_spread <= -self.Q:
+                            self.close_position(pos, current, '价差亏损止损')
+                            continue
+            # 资金费率套利
+            elif pos['触发模式'] == '资金费率套利':
+                # 平仓条件a: 资金费率收敛或反转
+                open_funding_spread = pos['开仓资金费率差']
+                funding_direction_reversed = (open_funding_spread > 0 and funding_spread < 0) or (open_funding_spread < 0 and funding_spread > 0)
+                if abs(funding_spread) < self.B or funding_direction_reversed:
+                    self.close_position(pos, current, '资金费率收敛或反转')
+                    continue
+                # 平仓条件b: 价差盈利平仓
+                if funding_spread > 0 and price_spread >= self.P:
+                    self.close_position(pos, current, '价差盈利平仓')
+                    continue
+                # 平仓条件c: 价差亏损止损
+                if price_spread <= -self.Q:
+                    self.close_position(pos, current, '价差亏损止损')
+                    continue
+            # 组合套利
+            elif pos['触发模式'] == '组合套利':
+                open_funding_spread = pos['开仓资金费率差']
+                funding_direction_reversed = (open_funding_spread > 0 and funding_spread < 0) or (open_funding_spread < 0 and funding_spread > 0)
+                # 平仓条件a: 资金费率收敛/反转或价差盈利
+                if abs(funding_spread) <= self.B or funding_direction_reversed or price_spread >= self.P:
+                    self.close_position(pos, current, '资金费率收敛/反转或价差盈利')
+                    continue
+                # 平仓条件b: 价差亏损止损
+                if price_spread <= -self.Q:
+                    self.close_position(pos, current, '价差亏损止损')
+                    continue
 
     def close_position(self, pos, current, reason):
         pos['平仓'] = True
