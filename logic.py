@@ -24,10 +24,14 @@ class ArbitrageSystem:
     def check_open(self, df, idx):
         # 获取当前和历史N小时数据
         current = df.iloc[idx]
-        history = df.iloc[max(0, idx-self.N):idx]
-        price_spread = current['price_a'] - current['price_b']
+        current_ts = current.name
+        # 以时间窗口（小时）筛选历史
+        window_start = current_ts - self.N * 3600
+        history = df.loc[(df.index >= window_start) & (df.index < current_ts)]
+        # 使用相对价差（百分比）判断
+        price_spread = (current['price_a'] - current['price_b']) / current['price_b']
         funding_spread = current['funding_a'] - current['funding_b']
-        avg_price_spread = history['price_a'].mean() - history['price_b'].mean() if not history.empty else 0
+        avg_price_spread = ((history['price_a'] - history['price_b']) / history['price_b']).mean() if not history.empty else 0
         same_direction = self.direction(price_spread, funding_spread)
 
         # 差价套利开仓条件
@@ -50,8 +54,8 @@ class ArbitrageSystem:
         return None
 
     def open_position(self, mode, cond, current, price_spread, funding_spread, avg_price_spread, direction):
-        # 记录开仓信息
-        self.positions.append({
+        # 记录开仓信息并返回，便于后续平仓跟踪
+        position = {
             '触发模式': mode,
             '触发条件': cond,
             '开仓差价': price_spread,
@@ -65,15 +69,18 @@ class ArbitrageSystem:
             '开仓时间戳': current.name,
             '平仓': False,
             '平仓信息': None
-        })
+        }
+        self.positions.append(position)
+        return position
 
     def check_close(self, df, idx):
         # 遍历所有未平仓的持仓，判断是否满足平仓条件
+        closed_any = False
         for pos in self.positions:
             if pos['平仓']:
                 continue
             current = df.iloc[idx]
-            price_spread = current['price_a'] - current['price_b']
+            price_spread = (current['price_a'] - current['price_b']) / current['price_b']
             funding_spread = current['funding_a'] - current['funding_b']
             # 差价套利
             if pos['触发模式'] == '差价套利':
@@ -82,6 +89,7 @@ class ArbitrageSystem:
                     # 平仓条件a: 价格回归盈利
                     if price_spread >= self.P:
                         self.close_position(pos, current, '价格回归盈利')
+                        closed_any = True
                         continue
                     # 平仓条件b: 资金费率反转止损
                     # 价差无利可图
@@ -92,20 +100,24 @@ class ArbitrageSystem:
                         # 资金费率数值 > A 且持续时间 > M
                         if funding_direction_reversed and abs(funding_spread) > self.A:
                             # 检查持续时间
-                            close_idx = idx
-                            open_idx = df.index.get_loc(pos['开仓时间戳'])
-                            if close_idx - open_idx >= self.M:
+                            close_ts = current.name
+                            open_ts = pos['开仓时间戳']
+                            hours = (close_ts - open_ts) / 3600
+                            if hours >= self.M:
                                 self.close_position(pos, current, '资金费率反转止损')
+                                closed_any = True
                                 continue
                         # 平仓条件c: 价差亏损止损
                         if price_spread <= -self.Q:
                             self.close_position(pos, current, '价差亏损止损')
+                            closed_any = True
                             continue
                 # 条件b（不同方向差价套利）
                 elif pos['触发条件'] == '条件b':
                     # 平仓条件a: 价格回归盈利
                     if price_spread >= self.P:
                         self.close_position(pos, current, '价格回归盈利')
+                        closed_any = True
                         continue
                     # 平仓条件b: 资金费率扩大止损
                     if price_spread < self.X:
@@ -115,14 +127,17 @@ class ArbitrageSystem:
                             open_funding_spread = pos['开仓资金费率差']
                             if abs(open_funding_spread) < self.A and abs(funding_spread) > self.B:
                                 # 检查持续时间
-                                close_idx = idx
-                                open_idx = df.index.get_loc(pos['开仓时间戳'])
-                                if close_idx - open_idx >= self.M:
+                                close_ts = current.name
+                                open_ts = pos['开仓时间戳']
+                                hours = (close_ts - open_ts) / 3600
+                                if hours >= self.M:
                                     self.close_position(pos, current, '资金费率扩大止损')
+                                    closed_any = True
                                     continue
                         # 平仓条件c: 价差亏损止损
                         if price_spread <= -self.Q:
                             self.close_position(pos, current, '价差亏损止损')
+                            closed_any = True
                             continue
             # 资金费率套利
             elif pos['触发模式'] == '资金费率套利':
@@ -131,14 +146,17 @@ class ArbitrageSystem:
                 funding_direction_reversed = (open_funding_spread > 0 and funding_spread < 0) or (open_funding_spread < 0 and funding_spread > 0)
                 if abs(funding_spread) < self.B or funding_direction_reversed:
                     self.close_position(pos, current, '资金费率收敛或反转')
+                    closed_any = True
                     continue
                 # 平仓条件b: 价差盈利平仓
                 if funding_spread > 0 and price_spread >= self.P:
                     self.close_position(pos, current, '价差盈利平仓')
+                    closed_any = True
                     continue
                 # 平仓条件c: 价差亏损止损
                 if price_spread <= -self.Q:
                     self.close_position(pos, current, '价差亏损止损')
+                    closed_any = True
                     continue
             # 组合套利
             elif pos['触发模式'] == '组合套利':
@@ -147,11 +165,17 @@ class ArbitrageSystem:
                 # 平仓条件a: 资金费率收敛/反转或价差盈利
                 if abs(funding_spread) <= self.B or funding_direction_reversed or price_spread >= self.P:
                     self.close_position(pos, current, '资金费率收敛/反转或价差盈利')
+                    closed_any = True
                     continue
                 # 平仓条件b: 价差亏损止损
                 if price_spread <= -self.Q:
                     self.close_position(pos, current, '价差亏损止损')
+                    closed_any = True
                     continue
+        return closed_any
+
+    def has_open_positions(self):
+        return any(not p['平仓'] for p in self.positions)
 
     def close_position(self, pos, current, reason):
         pos['平仓'] = True
@@ -270,14 +294,14 @@ df = df.loc[mask]
 
 # 实例化套利系统，参数可根据实际需求调整
 system = ArbitrageSystem(
-    X=0.01,  # 差价触发阈值
-    Y=0.001, # 资金费率差触发阈值
-    A=0.005, # 可忽略差价阈值
-    B=0.0005,# 可忽略资金费率差阈值
-    N=24,    # 历史小时数
-    M=2,     # 资金费率不利持续时间
-    P=0.02,  # 盈利平仓阈值
-    Q=0.01   # 亏损止损阈值
+    X=0.000068,  # 差价触发阈值
+    Y=0.000038, # 资金费率差触发阈值
+    A=0.000235, # 可忽略差价阈值
+    B=0.00014,# 可忽略资金费率差阈值
+    N=5,    # 历史小时数
+    M=5,     # 资金费率不利持续时间
+    P=0.0049,  # 盈利平仓阈值
+    Q=0.000062   # 亏损止损阈值
 )
 
 # 预处理数据，构造套利逻辑所需字段
@@ -286,26 +310,34 @@ df['price_b'] = df['binance_price']
 df['funding_a'] = df['okx_funding']
 df['funding_b'] = df['binance_funding']
 
+# 对齐时间序列并清洗缺失值，避免 NaN 造成开平仓判断异常
+df.sort_index(inplace=True)
 
-# 模拟实时交易：开仓后从下一个数据点开始判断平仓
-open_positions = []  # 存储未平仓持仓的索引和信息
+# 先记录原始可用数据的最后时间戳，再做前向填充，避免前值填充把缺失尾段误判为可用
+last_valids = []
+for col in ['price_a', 'price_b', 'funding_a', 'funding_b']:
+    lv = df[col].last_valid_index()
+    if lv is not None:
+        last_valids.append(lv)
+cutoff = min(last_valids) if last_valids else None
+
+# 再填充，随后按原始可用截止截断
+df[['price_a', 'price_b', 'funding_a', 'funding_b']] = df[['price_a', 'price_b', 'funding_a', 'funding_b']].ffill()
+if cutoff is not None:
+    df = df.loc[:cutoff]
+# 截断后再 dropna，避免尾部缺口导致的虚假平仓
+df = df.dropna(subset=['price_a', 'price_b', 'funding_a', 'funding_b'])
+
+
+# 模拟实时交易：持仓未平仓前不再开新仓
 for idx in range(len(df)):
-    # 只在当前时刻判断是否开仓
-    pos = system.check_open(df, idx)
-    if pos is not None:
-        # 记录开仓时的索引，便于后续平仓判断
-        open_positions.append({'open_idx': idx, 'pos_ref': system.positions[-1]})
-
-# 对每个持仓，从开仓点的下一个数据点开始，逐步判断平仓
-for op in open_positions:
-    open_idx = op['open_idx']
-    pos_ref = op['pos_ref']
-    # 只要未平仓，就继续往后判断
-    for idx in range(open_idx + 1, len(df)):
-        if not pos_ref['平仓']:
-            system.check_close(df, idx)
-        else:
-            break
+    closed_now = system.check_close(df, idx)
+    if system.has_open_positions():
+        continue
+    if closed_now:
+        # 本周期刚平仓，为避免同一周期即刻再开仓，跳过本周期
+        continue
+    system.check_open(df, idx)
 
 # 输出开仓和平仓信息到文件
 def convert(obj):
@@ -322,9 +354,57 @@ def convert(obj):
 with open('套利系统/arbitrage_positions.json', 'w', encoding='utf-8') as f:
     json.dump(convert(system.positions), f, ensure_ascii=False, indent=2)
 
-# 控制台输出
+# === 计算总收益率（价格收益率 + 资金费率收益，不含手续费/滑点）===
+def calc_price_return(position):
+    if not position.get('平仓'):
+        return 0.0
+    open_spread = position['开仓差价']
+    open_a = position['开仓价格a']
+    open_b = position['开仓价格b']
+    close_a = position['平仓信息']['平仓价格a']
+    close_b = position['平仓信息']['平仓价格b']
+    # 假设 spread>0 时开仓为 空a 多b；spread<0 时为 多a 空b
+    if open_spread >= 0:
+        # 两腿各占50%资金：空a收益率 + 多b收益率
+        ret = 0.5 * ((open_a - close_a) / open_a) + 0.5 * ((close_b - open_b) / open_b)
+    else:
+        # 多a收益率 + 空b收益率
+        ret = 0.5 * ((close_a - open_a) / open_a) + 0.5 * ((open_b - close_b) / open_b)
+    return float(ret)
+
+def calc_funding_return(position, funding_df):
+    if not position.get('平仓'):
+        return 0.0
+    open_ts = position['开仓时间戳']
+    close_ts = position['平仓信息']['平仓时间戳']
+    # 提取持仓期间的资金费率序列（含开仓、平仓时刻）
+    seg = funding_df.loc[(funding_df.index >= open_ts) & (funding_df.index <= close_ts)]
+    if seg.empty:
+        return 0.0
+    open_spread = position['开仓差价']
+    # spread>0 -> 空a 多b；spread<0 -> 多a 空b
+    sign_a = -1 if open_spread >= 0 else 1
+    sign_b = -sign_a
+    # 资金费率加权：按区间时长（小时）累计；两腿各占50%资金
+    seg = seg.sort_index()
+    ts_list = list(seg.index) + [close_ts]
+    total = 0.0
+    for i, ts in enumerate(seg.index):
+        next_ts = ts_list[i+1]
+        hours = max(0, (next_ts - ts) / 3600)
+        rate_eff = 0.5 * seg.loc[ts, 'funding_a'] * sign_a + 0.5 * seg.loc[ts, 'funding_b'] * sign_b
+        total += rate_eff * hours
+    return float(total)
+
+# 计算并打印总收益率（复利）
+funding_df = df[['funding_a', 'funding_b']].copy().ffill().dropna()
+cum_return = 1.0
 for pos in system.positions:
-    print("开仓信息:", {k: v for k, v in pos.items() if k != '平仓信息'})
-    if pos['平仓']:
-        print("平仓信息:", pos['平仓信息'])
+    price_ret = calc_price_return(pos)
+    funding_ret = calc_funding_return(pos, funding_df)
+    total_ret = price_ret + funding_ret
+    cum_return *= (1 + total_ret)
+
+final_return_pct = (cum_return - 1) * 100
+print(f"最终收益率: {final_return_pct:.4f}%")
 

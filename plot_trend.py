@@ -3,6 +3,11 @@ import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
 from glob import glob
+import json
+
+# 设置matplotlib支持中文显示
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']  # 用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 
 def extract_btc_usdt_swap_funding(data_folder, output_file):
     files = glob(f"{data_folder}/allswap-fundingrates-*.csv")
@@ -126,22 +131,151 @@ df['datetime'] = pd.to_datetime(df.index, unit='s')
 mask = (df['datetime'] >= pd.Timestamp('2025-11-24')) & (df['datetime'] <= pd.Timestamp('2025-12-07 16:00:00'))
 df = df.loc[mask]
 
-# 绘图
-plt.figure(figsize=(14, 6))
-plt.subplot(2, 1, 1)
-plt.plot(df['datetime'], df['binance_price'], label='Binance Price')
-plt.plot(df['datetime'], df['okx_price'], label='OKX Price')
-plt.legend()
-plt.title('BTC-USDT Price Trend')
-plt.ylabel('Price')
+# 截断缺数据的末端：以四列的最后有效时间戳最小值为截止，避免用前值填补无数据的尾段
+last_valids = []
+for col in ['binance_price', 'okx_price', 'binance_funding', 'okx_funding']:
+    lv = df[col].last_valid_index()
+    if lv is not None:
+        last_valids.append(lv)
+cutoff = min(last_valids) if last_valids else None
+if cutoff is not None:
+    df = df.loc[:cutoff]
 
-plt.subplot(2, 1, 2)
-plt.step(df['datetime'], df['binance_funding'], where='post', label='Binance Funding Rate')
-plt.step(df['datetime'], df['okx_funding'], where='post', label='OKX Funding Rate')
+# 绘图
+plt.figure(figsize=(14, 8))
+plt.subplot(3, 1, 1)
+plt.plot(df['datetime'], df['binance_price'], label='Binance 价格')
+plt.plot(df['datetime'], df['okx_price'], label='OKX 价格')
+# 标注开/平仓点（使用 OKX 价格作为锚点）
+try:
+    with open('套利系统/arbitrage_positions.json', 'r', encoding='utf-8') as f:
+        positions = json.load(f)
+    if positions:
+        pos_df = pd.DataFrame(positions)
+        # 准备时间戳列
+        pos_df['open_ts'] = pd.to_numeric(pos_df['开仓时间戳'], errors='coerce')
+        pos_df['close_ts'] = pos_df['平仓信息'].apply(lambda x: pd.to_numeric(x.get('平仓时间戳'), errors='coerce') if x and isinstance(x, dict) else None)
+        pos_df['open_dt'] = pd.to_datetime(pos_df['open_ts'], unit='s', errors='coerce')
+        pos_df['close_dt'] = pd.to_datetime(pos_df['close_ts'], unit='s', errors='coerce')
+
+        # 准备价格参考数据
+        price_ref = df[['datetime', 'okx_price']].dropna().copy()
+        if not price_ref.empty:
+            price_ref['ts'] = (price_ref['datetime'].astype('int64') // 10**9).astype('int64')
+            price_ref = price_ref.sort_values('ts')
+            ts_min, ts_max = price_ref['ts'].min(), price_ref['ts'].max()
+
+            # 过滤开仓点：在时间范围内且有价格数据
+            open_valid = pos_df.dropna(subset=['open_ts', 'open_dt'])
+            open_valid = open_valid[(open_valid['open_ts'] >= ts_min) & (open_valid['open_ts'] <= ts_max)]
+            
+            if not open_valid.empty:
+                # 直接使用时间戳匹配价格
+                open_valid = open_valid.copy()
+                open_valid['price'] = open_valid['open_ts'].map(price_ref.set_index('ts')['okx_price'])
+                open_valid = open_valid.dropna(subset=['price'])
+                if not open_valid.empty:
+                    plt.scatter(open_valid['open_dt'], open_valid['price'], color='green', marker='^', s=60, label='开仓', zorder=5)
+
+            # 过滤平仓点：在时间范围内且有价格数据
+            close_valid = pos_df.dropna(subset=['close_ts', 'close_dt'])
+            close_valid = close_valid[(close_valid['close_ts'] >= ts_min) & (close_valid['close_ts'] <= ts_max)]
+            
+            if not close_valid.empty:
+                close_valid = close_valid.copy()
+                close_valid['price'] = close_valid['close_ts'].map(price_ref.set_index('ts')['okx_price'])
+                close_valid = close_valid.dropna(subset=['price'])
+                if not close_valid.empty:
+                    plt.scatter(close_valid['close_dt'], close_valid['price'], color='red', marker='v', s=60, label='平仓', zorder=5)
+except Exception as e:
+    print(f"绘图标注错误: {e}")
+    import traceback
+    traceback.print_exc()
 plt.legend()
-plt.title('BTC-USDT Funding Rate Trend')
-plt.ylabel('Funding Rate')
-plt.xlabel('Time')
+plt.title('BTC-USDT 价格趋势')
+plt.ylabel('价格')
+plt.xlabel('时间')
+
+plt.subplot(3, 1, 2)
+plt.step(df['datetime'], df['binance_funding'], where='post', label='Binance 资金费率')
+plt.step(df['datetime'], df['okx_funding'], where='post', label='OKX 资金费率')
+plt.legend()
+plt.title('BTC-USDT 资金费率趋势')
+plt.ylabel('资金费率')
+
+# 收益率变化趋势（按平仓时间累积收益率）
+plt.subplot(3, 1, 3)
+try:
+    with open('套利系统/arbitrage_positions.json', 'r', encoding='utf-8') as f:
+        positions_for_ret = json.load(f)
+    pos_df_ret = pd.DataFrame(positions_for_ret)
+    if not pos_df_ret.empty:
+        def calc_price_return(row):
+            if row['平仓信息'] is None:
+                return 0.0
+            open_spread = row['开仓差价']
+            open_a = row['开仓价格a']; open_b = row['开仓价格b']
+            close_a = row['平仓信息']['平仓价格a']; close_b = row['平仓信息']['平仓价格b']
+            # 与 logic.py 保持一致：两腿各占50%资金
+            if open_spread >= 0:
+                return 0.5 * ((open_a - close_a) / open_a) + 0.5 * ((close_b - open_b) / open_b)
+            else:
+                return 0.5 * ((close_a - open_a) / open_a) + 0.5 * ((open_b - close_b) / open_b)
+
+        def calc_funding_return(row, funding_df):
+            if row['平仓信息'] is None:
+                return 0.0
+            open_ts = row['开仓时间戳']; close_ts = row['平仓信息']['平仓时间戳']
+            seg = funding_df.loc[(funding_df.index >= open_ts) & (funding_df.index <= close_ts)]
+            if seg.empty:
+                return 0.0
+            open_spread = row['开仓差价']
+            sign_a = -1 if open_spread >= 0 else 1
+            sign_b = -sign_a
+            # 与 logic.py 保持一致：按时间加权，两腿各占50%资金
+            seg = seg.sort_index()
+            ts_list = list(seg.index) + [close_ts]
+            total = 0.0
+            for i, ts in enumerate(seg.index):
+                next_ts = ts_list[i+1]
+                hours = max(0, (next_ts - ts) / 3600)
+                rate_eff = 0.5 * seg.loc[ts, 'funding_a'] * sign_a + 0.5 * seg.loc[ts, 'funding_b'] * sign_b
+                total += rate_eff * hours
+            return float(total)
+
+        # 兼容列名（plot_trend 内部使用 okx_funding/binance_funding）
+        funding_df = pd.DataFrame({
+            'funding_a': df['okx_funding'],
+            'funding_b': df['binance_funding'],
+        }).ffill().dropna()
+        pos_df_ret['close_ts'] = pos_df_ret['平仓信息'].apply(lambda x: x.get('平仓时间戳') if x else None)
+        pos_df_ret['close_ts'] = pd.to_numeric(pos_df_ret['close_ts'], errors='coerce')
+        # 过滤超出价格数据时间范围的记录，避免在缺数据段计算收益
+        ts_min, ts_max = df.index.min(), df.index.max()
+        pos_df_ret = pos_df_ret[(pos_df_ret['close_ts'] >= ts_min) & (pos_df_ret['close_ts'] <= ts_max)]
+        pos_df_ret['close_dt'] = pd.to_datetime(pos_df_ret['close_ts'], unit='s')
+        pos_df_ret = pos_df_ret.dropna(subset=['close_dt'])
+        pos_df_ret['price_ret'] = pos_df_ret.apply(calc_price_return, axis=1)
+        pos_df_ret['funding_ret'] = pos_df_ret.apply(lambda r: calc_funding_return(r, funding_df), axis=1)
+        pos_df_ret['total_ret'] = pos_df_ret['price_ret'] + pos_df_ret['funding_ret']
+        pos_df_ret = pos_df_ret.sort_values('close_dt')
+        if not pos_df_ret.empty:
+            # 使用复利计算累计收益率（与 logic.py 保持一致）
+            cum_return = 1.0
+            cum_returns = []
+            for ret in pos_df_ret['total_ret']:
+                cum_return *= (1 + ret)
+                cum_returns.append((cum_return - 1) * 100)
+            pos_df_ret['cum_ret_pct'] = cum_returns
+            plt.plot(pos_df_ret['close_dt'], pos_df_ret['cum_ret_pct'], label='累计收益率', linewidth=2)
+            plt.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.title('累计收益率趋势')
+            plt.ylabel('收益率 (%)')
+    plt.xlabel('时间')
+except Exception:
+    pass
 
 plt.tight_layout()
 plt.show()
